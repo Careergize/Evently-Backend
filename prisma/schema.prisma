@@ -1,0 +1,175 @@
+generator client {
+ provider = "prisma-client-js"
+}
+datasource db {
+ provider = "postgresql"
+ 
+}
+model User {
+ id String @id @default(cuid())
+ name String
+ email String @unique
+ passwordHash String
+ role String @default("ORGANISER")
+ createdAt DateTime @default(now())
+ sessions Session[]
+ resets PasswordResetToken[]
+ events Event[]
+}
+model Session {
+ id String @id @default(cuid())
+ tokenHash String @unique
+ userId String
+ user User @relation(fields:[userId], references:[id], onDelete:Cascade)
+ expiresAt DateTime
+ @@index([userId])
+}
+model PasswordResetToken {
+ id String @id @default(cuid())
+ tokenHash String @unique
+ userId String
+ user User @relation(fields:[userId],references:[id],onDelete:Cascade)
+ expiresAt DateTime
+}
+model Event {
+ id String @id @default(cuid())
+ ownerId String
+ owner User @relation(fields:[ownerId],references:[id],onDelete:Cascade)
+ title String
+ type String @default("Wedding")
+ host String
+ description String @default("")
+ startsAt DateTime
+ endsAt DateTime?
+ timezone String @default("Asia/Kolkata")
+ venue String @default("")
+ address String @default("")
+ mapsUrl String @default("")
+ coverImage String @default("")
+ template String @default("Botanical")
+ theme String @default("emerald")
+ message String @default("")
+ status String @default("DRAFT")
+ publicToken String @unique
+ createdAt DateTime @default(now())
+ updatedAt DateTime @updatedAt
+ settings EventSettings?
+ invitations Invitation[]
+ households Household[]
+ sessions EventSession[]
+ @@index([ownerId,startsAt])
+}
+model EventSettings {
+ eventId String @id
+ event Event @relation(fields:[eventId],references:[id],onDelete:Cascade)
+ rsvpEnabled Boolean @default(true)
+ deadline DateTime?
+ allowMaybe Boolean @default(true)
+ allowPartySize Boolean @default(true)
+ maxPartySize Int @default(10)
+ mealsEnabled Boolean @default(true)
+ messagesEnabled Boolean @default(true)
+ confirmedProbability Float @default(1)
+ maybeProbability Float @default(0.5)
+ pendingProbability Float @default(0.3)
+ adjustment Int @default(0)
+ contingency Float @default(10)
+}
+model Household {
+ id String @id @default(cuid())
+ name String
+ eventId String
+ event Event @relation(fields:[eventId],references:[id],onDelete:Cascade)
+ invitations Invitation[]
+ @@unique([eventId,name])
+}
+model Invitation {
+ id String @id @default(cuid())
+ eventId String
+ event Event @relation(fields:[eventId],references:[id],onDelete:Cascade)
+ householdId String?
+ household Household? @relation(fields:[householdId],references:[id],onDelete:SetNull)
+ token String @unique
+ name String
+ email String?
+ phone String?
+ invitedSize Int @default(1)
+ source String @default("TRACKED")
+ dedupeKey String
+ revoked Boolean @default(false)
+ sentAt DateTime?
+ createdAt DateTime @default(now())
+ rsvp RSVP?
+ @@unique([eventId,dedupeKey])
+ @@index([eventId])
+}
+model RSVP {
+ id String @id @default(cuid())
+ invitationId String @unique
+ invitation Invitation @relation(fields:[invitationId],references:[id],onDelete:Cascade)
+ status String
+ partySize Int
+ meal String @default("Vegetarian")
+ message String @default("")
+ createdAt DateTime @default(now())
+ updatedAt DateTime @updatedAt
+ selections RSVPMealSelection[]
+}
+model EventSession {
+ id String @id @default(cuid())
+ eventId String
+ event Event @relation(fields:[eventId],references:[id],onDelete:Cascade)
+ title String
+ startsAt DateTime
+ plans CateringPlan[]
+ selections RSVPMealSelection[]
+ @@index([eventId])
+}
+model RSVPMealSelection {
+ id String @id @default(cuid())
+ rsvpId String
+ rsvp RSVP @relation(fields:[rsvpId],references:[id],onDelete:Cascade)
+ sessionId String
+ session EventSession @relation(fields:[sessionId],references:[id],onDelete:Cascade)
+ attendees Int
+ meal String
+ @@unique([rsvpId,sessionId])
+}
+model CateringPlan {
+ id String @id @default(cuid())
+ sessionId String @unique
+ session EventSession @relation(fields:[sessionId],references:[id],onDelete:Cascade)
+ expected Int
+ pricePerPlate Float
+ contingency Float @default(10)
+ overrideCount Int?
+ vegetarian Int @default(0)
+ nonVegetarian Int @default(0)
+ originalCount Int
+ mealType String @default("Buffet")
+ updatedAt DateTime @updatedAt
+}
+model PartnerLead {
+ id String @id @default(cuid())
+ businessName String
+ contactName String
+ category String
+ email String
+ phone String
+ city String
+ message String
+ createdAt DateTime @default(now())
+}
+model AuditLog {
+ id String @id @default(cuid())
+ actorId String?
+ action String
+ entityId String?
+ createdAt DateTime @default(now())
+ @@index([entityId,createdAt])
+}
+model RateLimit {
+ key String @id
+ count Int
+ expiresAt DateTime
+}

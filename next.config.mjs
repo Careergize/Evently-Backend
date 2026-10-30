@@ -1,0 +1,1 @@
+export default {serverExternalPackages:['@prisma/client','bcryptjs','nodemailer'],poweredByHeader:false,async headers(){return [{source:'/api/:path*',headers:[{key:'Cache-Control',value:'private, no-store'},{key:'X-Content-Type-Options',value:'nosniff'},{key:'Referrer-Policy',value:'no-referrer'}]}];}};

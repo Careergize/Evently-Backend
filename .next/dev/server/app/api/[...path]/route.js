@@ -1,0 +1,10 @@
+var R=require("../../../chunks/[turbopack]_runtime.js")("server/app/api/[...path]/route.js")
+R.c("server/chunks/node_modules_next_1506we323rmr8._.js")
+R.c("server/chunks/node_modules_zod_v4_classic_1gp5imlp39mf8._.js")
+R.c("server/chunks/node_modules_zod_v4_core_0yfsh0dphquad._.js")
+R.c("server/chunks/node_modules_zod_v4_locales_0on3-qho2_wkm._.js")
+R.c("server/chunks/[root-of-the-server]__1_gre3n5ndftk._.js")
+R.c("server/chunks/[root-of-the-server]__1228n5mxpqh9d._.js")
+R.c("server/chunks/backend__next-internal_server_app_api_[___path]_route_actions_0-7jt1l59bgan.js")
+R.m("[project]/node_modules/next/dist/esm/build/templates/app-route.js { INNER_APP_ROUTE => \"[project]/backend/src/app/api/[...path]/route.ts [app-route] (ecmascript)\" } [app-route] (ecmascript)")
+module.exports=R.m("[project]/node_modules/next/dist/esm/build/templates/app-route.js { INNER_APP_ROUTE => \"[project]/backend/src/app/api/[...path]/route.ts [app-route] (ecmascript)\" } [app-route] (ecmascript)").exports
