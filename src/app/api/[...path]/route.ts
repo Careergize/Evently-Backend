@@ -370,7 +370,7 @@ async function handle(
               .sendMail({
                 from: process.env.MAIL_FROM,
                 to: u.email,
-                subject: "Reset your Inviora password",
+                subject: "Reset your Veyra password",
                 text: `Reset your password within one hour: ${link}`,
               });
           } else if (process.env.NODE_ENV !== "production") {

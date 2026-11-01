@@ -1,3 +1,3 @@
 export default function Page() {
-  return <main>Evently API</main>;
+  return <main>Veyra API</main>;
 }
