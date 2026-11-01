@@ -2,7 +2,9 @@ import { NextRequest, NextResponse } from "next/server";
 import { randomBytes, createHash } from "node:crypto";
 import { hash, compare } from "bcryptjs";
 import { z } from "zod";
-import { parse } from "csv-parse/sync";
+import { canPerform, type AccessRole } from "@/lib/permissions";
+import { reminderKinds, reminderMessage } from "@/lib/reminders";
+import { previewImport } from "@/lib/imports";
 import nodemailer from "nodemailer";
 import { db } from "@/lib/db";
 import {
@@ -32,8 +34,10 @@ const fail = (status: number, message: string): never => {
 };
 const include = {
   settings: true,
-  invitations: { include: { rsvp: true, household: true } },
-  sessions: { include: { plans: true } },
+  invitations: {
+    include: { rsvp: { include: { selections: true } }, household: true },
+  },
+  sessions: { include: { plans: true, checkIns: true } },
 } as const;
 async function limit(req: NextRequest, scope: string, max = 30) {
   const ip =
@@ -63,11 +67,84 @@ async function user(req: NextRequest) {
   if (!s || s.expiresAt < new Date()) return fail(401, "Please sign in");
   return s.user;
 }
-async function owned(req: NextRequest, id: string) {
+async function owned(req: NextRequest, id: string, resource = "event") {
   const u = await user(req);
-  const e = await db.event.findFirst({ where: { id, ownerId: u.id }, include });
+  const e = await db.event.findFirst({
+    where: {
+      id,
+      OR: [
+        { ownerId: u.id },
+        {
+          collaborators: {
+            some: {
+              userId: u.id,
+              acceptedAt: { not: null },
+              role: { in: ["MANAGER", "VIEWER"] },
+            },
+          },
+        },
+      ],
+    },
+    include: { ...include, collaborators: true },
+  });
   if (!e) return fail(404, "Event not found");
-  return e;
+  const accessRole: AccessRole =
+    e.ownerId === u.id
+      ? "OWNER"
+      : (e.collaborators.find((c) => c.userId === u.id)!.role as AccessRole);
+  if (!canPerform(accessRole, req.method, resource))
+    fail(403, "Your event role does not allow this action");
+  return { ...e, accessRole, actorId: u.id };
+}
+function eventView(e: any, accessRole: AccessRole) {
+  const { collaborators, actorId, ...data } = e;
+  void collaborators;
+  void actorId;
+  if (accessRole === "VIEWER") {
+    return {
+      ...data,
+      publicToken: "",
+      invitations: [],
+      sessions: e.sessions.map(({ checkIns, ...session }: any) => {
+        void checkIns;
+        return session;
+      }),
+      accessRole,
+      analytics: aggregate(e),
+    };
+  }
+  return { ...data, accessRole, analytics: aggregate(e) };
+}
+function partnerSummary(e: any) {
+  const a = aggregate(e);
+  return {
+    id: e.id,
+    title: e.title,
+    startsAt: e.startsAt,
+    timezone: e.timezone,
+    functions: e.sessions
+      .filter((s: any) => s.mealsEnabled)
+      .map((s: any) => {
+        const f = a.functions.find((v: any) => v.id === s.id);
+        const p = s.plans[0];
+        return {
+          title: s.title,
+          startsAt: s.startsAt,
+          confirmed: f.confirmed,
+          expected: p?.expected ?? f.expected,
+          suggested: p ? catering(p).count : f.recommended,
+          meals: p
+            ? {
+                Vegetarian: p.vegetarian,
+                "Non-vegetarian": p.nonVegetarian,
+                Unassigned: p.expected - p.vegetarian - p.nonVegetarian,
+              }
+            : f.meals,
+          planningNotes: p?.planningNotes || "",
+          calculatedAt: p?.updatedAt || new Date().toISOString(),
+        };
+      }),
+  };
 }
 async function audit(action: string, actorId?: string, entityId?: string) {
   await db.auditLog.create({ data: { action, actorId, entityId } });
@@ -117,7 +194,11 @@ async function invitation(t: string) {
     where: { publicToken: t },
     include: { settings: true, sessions: true },
   });
-  if (!event || event.status !== "PUBLISHED")
+  if (
+    !event ||
+    event.status !== "PUBLISHED" ||
+    !event.settings?.publicLinksEnabled
+  )
     return fail(404, "Invitation unavailable");
   return { event, guest: null };
 }
@@ -142,6 +223,61 @@ async function handle(
       if (p[1] === "me" && method === "GET") {
         const u = await user(req);
         return ok({ id: u.id, name: u.name, email: u.email });
+      }
+      if (p[1] === "profile" && method === "PATCH") {
+        const u = await user(req);
+        const { name } = z
+          .object({ name: z.string().trim().min(2).max(100) })
+          .parse(await json(req));
+        await db.user.update({ where: { id: u.id }, data: { name } });
+        return ok({ id: u.id, name, email: u.email });
+      }
+      if (p[1] === "password" && method === "POST") {
+        const u = await user(req);
+        const v = z
+          .object({
+            currentPassword: z.string().max(200),
+            password: z
+              .string()
+              .min(12)
+              .refine((v) => Buffer.byteLength(v, "utf8") <= 72),
+          })
+          .parse(await json(req));
+        await limit(req, "password-change", 10);
+        if (!(await compare(v.currentPassword, u.passwordHash)))
+          fail(403, "Current password is incorrect");
+        await db.$transaction(async (tx) => {
+          await tx.user.update({
+            where: { id: u.id },
+            data: { passwordHash: await hash(v.password, 12) },
+          });
+          await tx.session.deleteMany({ where: { userId: u.id } });
+        });
+        await audit("account.password_changed", u.id);
+        return sessionCookie(
+          ok({ message: "Password changed. Sign in again." }),
+          "",
+          0,
+        );
+      }
+      if (p[1] === "export" && method === "GET") {
+        const u = await user(req);
+        const events = await db.event.findMany({
+          where: { ownerId: u.id },
+          include: {
+            ...include,
+            households: true,
+            forecasts: true,
+            collaborators: {
+              select: { email: true, role: true, acceptedAt: true },
+            },
+          },
+        });
+        return ok({
+          exportedAt: new Date().toISOString(),
+          profile: { name: u.name, email: u.email },
+          events,
+        });
       }
       if (p[1] === "logout" && method === "POST") {
         const raw = req.cookies.get("evently_session")?.value;
@@ -234,7 +370,7 @@ async function handle(
               .sendMail({
                 from: process.env.MAIL_FROM,
                 to: u.email,
-                subject: "Reset your Evently password",
+                subject: "Reset your Inviora password",
                 text: `Reset your password within one hour: ${link}`,
               });
           } else if (process.env.NODE_ENV !== "production") {
@@ -294,10 +430,146 @@ async function handle(
         return ok({ message: "Password updated. Please sign in." });
       }
     }
+    if (p[0] === "collaborations" && p[1] && method === "POST") {
+      const u = await user(req);
+      await limit(req, "collaboration-accept", 20);
+      if (!/^[a-f0-9]{64}$/.test(p[1])) fail(404, "Invitation unavailable");
+      const invitation = await db.collaborator.findUnique({
+        where: { tokenHash: digest(p[1]) },
+        include: { event: true },
+      });
+      if (
+        !invitation ||
+        invitation.expiresAt < new Date() ||
+        invitation.acceptedAt ||
+        invitation.email !== u.email
+      )
+        fail(404, "Invitation unavailable or sign in with the invited email");
+      await db.$transaction(async (tx) => {
+        const accepted = await tx.collaborator.updateMany({
+          where: {
+            id: invitation!.id,
+            acceptedAt: null,
+            expiresAt: { gt: new Date() },
+            email: u.email,
+          },
+          data: { userId: u.id, acceptedAt: new Date() },
+        });
+        if (!accepted.count) fail(409, "Invitation already used");
+        await tx.auditLog.create({
+          data: {
+            actorId: u.id,
+            action: "collaborator.accepted",
+            entityId: invitation!.eventId,
+          },
+        });
+        await tx.notification.create({
+          data: {
+            userId: invitation!.event.ownerId,
+            eventId: invitation!.eventId,
+            kind: "COLLABORATION",
+            message: `${invitation!.role === "PARTNER" ? "Partner" : "Family collaborator"} invitation accepted for ${invitation!.event.title}`,
+            dedupeKey: `collaborator:${invitation!.id}`,
+          },
+        });
+      });
+      return ok({
+        accepted: true,
+        role: invitation!.role,
+        eventId: invitation!.eventId,
+      });
+    }
+    if (p[0] === "partner-events" && method === "GET") {
+      const u = await user(req);
+      const events = await db.event.findMany({
+        where: {
+          collaborators: {
+            some: { userId: u.id, role: "PARTNER", acceptedAt: { not: null } },
+          },
+        },
+        include,
+      });
+      return ok(events.map(partnerSummary));
+    }
+    if (p[0] === "notifications") {
+      const u = await user(req);
+      if (method === "GET") {
+        const upcoming = await db.event.findMany({
+          where: {
+            ownerId: u.id,
+            startsAt: {
+              gte: new Date(),
+              lte: new Date(Date.now() + 7 * 86400000),
+            },
+          },
+          include: { settings: true },
+        });
+        const deadlines = await db.event.findMany({
+          where: {
+            ownerId: u.id,
+            settings: {
+              deadline: {
+                gte: new Date(),
+                lte: new Date(Date.now() + 3 * 86400000),
+              },
+              rsvpEnabled: true,
+            },
+          },
+          include: { settings: true },
+        });
+        for (const e of upcoming)
+          await db.notification.upsert({
+            where: {
+              dedupeKey: `upcoming:${e.id}:${e.startsAt.toISOString()}`,
+            },
+            create: {
+              userId: u.id,
+              eventId: e.id,
+              kind: "UPCOMING",
+              message: `${e.title} takes place within seven days`,
+              dedupeKey: `upcoming:${e.id}:${e.startsAt.toISOString()}`,
+            },
+            update: {},
+          });
+        for (const e of deadlines)
+          await db.notification.upsert({
+            where: {
+              dedupeKey: `deadline:${e.id}:${e.settings!.deadline!.toISOString()}`,
+            },
+            create: {
+              userId: u.id,
+              eventId: e.id,
+              kind: "DEADLINE",
+              message: `RSVP deadline approaching for ${e.title}`,
+              dedupeKey: `deadline:${e.id}:${e.settings!.deadline!.toISOString()}`,
+            },
+            update: {},
+          });
+        return ok(
+          await db.notification.findMany({
+            where: { userId: u.id },
+            orderBy: { createdAt: "desc" },
+            take: 100,
+          }),
+        );
+      }
+      if (method === "PATCH") {
+        const { id, read } = z
+          .object({ id: z.string(), read: z.boolean() })
+          .parse(await json(req));
+        const result = await db.notification.updateMany({
+          where: { id, userId: u.id },
+          data: { readAt: read ? new Date() : null },
+        });
+        if (!result.count) fail(404, "Notification not found");
+        return ok({ updated: true });
+      }
+    }
     if (p[0] === "partners" && p[1] === "interest" && method === "POST") {
       await limit(req, "partners", 5);
       const v = z
         .object({
+          services: z.string().max(1000).default(""),
           businessName: z.string().min(2).max(150),
           contactName: z.string().min(2).max(100),
           category: z.enum(["Caterer", "Event planner", "Other"]),
@@ -332,7 +604,39 @@ async function handle(
           response = own?.rsvp || null;
           respondentName = own?.name || null;
         }
-        const { id, publicToken, ownerId, ...publicEvent } = event;
+        const publicEvent = {
+          title: event.title,
+          type: event.type,
+          host: event.host,
+          description: event.description,
+          startsAt: event.startsAt,
+          endsAt: event.endsAt,
+          timezone: event.timezone,
+          venue: event.venue,
+          address: event.address,
+          mapsUrl: event.mapsUrl,
+          coverImage: event.coverImage,
+          template: event.template,
+          theme: event.theme,
+          message: event.message,
+          font: event.font,
+          rsvpLabel: event.rsvpLabel,
+          settings: {
+            rsvpEnabled: event.settings!.rsvpEnabled,
+            deadline: event.settings!.deadline,
+            allowMaybe: event.settings!.allowMaybe,
+            allowPartySize: event.settings!.allowPartySize,
+            maxPartySize: event.settings!.maxPartySize,
+            mealsEnabled: event.settings!.mealsEnabled,
+            messagesEnabled: event.settings!.messagesEnabled,
+          },
+          sessions: event.sessions.filter(
+            (s) =>
+              !guest?.invitedSessionIds.length ||
+              guest.invitedSessionIds.includes(s.id),
+          ),
+        };
+        const { id, publicToken, ownerId } = event;
         void id;
         void publicToken;
         void ownerId;
@@ -340,7 +644,11 @@ async function handle(
           event: publicEvent,
           respondentName,
           guest: guest
-            ? { name: guest.name, invitedSize: guest.invitedSize }
+            ? {
+                name: guest.name,
+                invitedSize: guest.invitedSize,
+                source: guest.source,
+              }
             : null,
           response: response
             ? {
@@ -377,6 +685,13 @@ async function handle(
                   source: "OPEN",
                 },
               });
+          if (
+            (!fresh.settings?.publicLinksEnabled ||
+              fresh.publicToken !== p[1]) &&
+            !guest
+          )
+            fail(404, "Invitation unavailable");
+          if (guest && !existing) fail(404, "Invitation unavailable");
           validateResponse(v, fresh, existing);
           let inv = existing;
           if (!inv)
@@ -404,16 +719,39 @@ async function handle(
             meal: fresh.settings!.mealsEnabled ? v.meal : "No preference",
             message: fresh.settings!.messagesEnabled ? v.message : "",
           };
+          const previous = await tx.rSVP.findUnique({
+            where: { invitationId: inv.id },
+            include: { selections: true },
+          });
           const r = await tx.rSVP.upsert({
             where: { invitationId: inv.id },
             create: { ...data, invitationId: inv.id },
             update: data,
           });
           await tx.rSVPMealSelection.deleteMany({ where: { rsvpId: r.id } });
-          if (v.selections?.length)
+          const selections =
+            v.selections ??
+            fresh.sessions
+              .filter(
+                (s) =>
+                  !inv.invitedSessionIds.length ||
+                  inv.invitedSessionIds.includes(s.id),
+              )
+              .map((s) => ({
+                sessionId: s.id,
+                attendees: data.partySize,
+                meal: data.meal,
+              }));
+          validateResponse({ ...v, selections }, fresh, inv);
+          if (selections.length)
             await tx.rSVPMealSelection.createMany({
-              data: v.selections.map((s) => ({
+              data: selections.map((s) => ({
                 ...s,
+                meal:
+                  fresh.settings!.mealsEnabled &&
+                  fresh.sessions.find((x) => x.id === s.sessionId)?.mealsEnabled
+                    ? s.meal
+                    : "No preference",
                 rsvpId: r.id,
                 attendees: v.status === "NO" ? 0 : s.attendees,
               })),
@@ -421,6 +759,39 @@ async function handle(
           await tx.auditLog.create({
             data: { action: "rsvp.updated", entityId: event.id },
           });
+          const changed =
+            !previous ||
+            ["status", "partySize", "meal", "message"].some(
+              (k) => (previous as any)[k] !== (data as any)[k],
+            ) ||
+            JSON.stringify(
+              previous.selections
+                .map((x) => [x.sessionId, x.attendees, x.meal])
+                .sort(),
+            ) !==
+              JSON.stringify(
+                selections
+                  .map((x) => [
+                    x.sessionId,
+                    v.status === "NO" ? 0 : x.attendees,
+                    fresh.settings!.mealsEnabled &&
+                    fresh.sessions.find((s) => s.id === x.sessionId)
+                      ?.mealsEnabled
+                      ? x.meal
+                      : "No preference",
+                  ])
+                  .sort(),
+              );
+          if (changed)
+            await tx.notification.create({
+              data: {
+                userId: fresh.ownerId,
+                eventId: fresh.id,
+                kind: previous ? "RSVP_UPDATED" : "RSVP_NEW",
+                message: `${previous ? "Guest attendance updated" : "New RSVP received"} for ${fresh.title}`,
+                dedupeKey: `rsvp:${r.id}:${token()}`,
+              },
+            });
         });
         return ok({ message: "Your response has been saved", responseToken });
       }
@@ -430,11 +801,34 @@ async function handle(
         const u = await user(req);
         if (method === "GET") {
           const events = await db.event.findMany({
-            where: { ownerId: u.id },
-            include,
+            where: {
+              OR: [
+                { ownerId: u.id },
+                {
+                  collaborators: {
+                    some: {
+                      userId: u.id,
+                      acceptedAt: { not: null },
+                      role: { in: ["MANAGER", "VIEWER"] },
+                    },
+                  },
+                },
+              ],
+            },
+            include: { ...include, collaborators: true },
             orderBy: { startsAt: "asc" },
           });
-          return ok(events.map((e) => ({ ...e, analytics: aggregate(e) })));
+          return ok(
+            events.map((e) =>
+              eventView(
+                e,
+                e.ownerId === u.id
+                  ? "OWNER"
+                  : (e.collaborators.find((c) => c.userId === u.id)!
+                      .role as AccessRole),
+              ),
+            ),
+          );
         }
         if (method === "POST") {
           const v = eventSchema.parse(await json(req));
@@ -454,9 +848,9 @@ async function handle(
           return ok(e, 201);
         }
       }
-      const e = await owned(req, p[1]);
+      const e = await owned(req, p[1], p[2] || "event");
       if (p.length === 2) {
-        if (method === "GET") return ok({ ...e, analytics: aggregate(e) });
+        if (method === "GET") return ok(eventView(e, e.accessRole));
         if (method === "PATCH") {
           const v = eventSchema.parse(await json(req));
           const { settings, ...data } = v;
@@ -464,56 +858,40 @@ async function handle(
             where: { id: e.id },
             data: { ...data, settings: { update: settings } },
           });
-          await audit("event.updated", e.ownerId, e.id);
+          await audit("event.updated", e.actorId, e.id);
           return ok({ id: e.id });
         }
         if (method === "DELETE") {
-          await db.event.delete({ where: { id: e.id } });
-          await audit("event.deleted", e.ownerId, e.id);
+          await db.$transaction(async (tx) => {
+            await tx.notification.deleteMany({ where: { eventId: e.id } });
+            await tx.event.delete({ where: { id: e.id } });
+          });
+          await audit("event.deleted", e.actorId, e.id);
           return ok({ deleted: true });
         }
       }
       if (p[2] === "analytics") return ok(aggregate(e));
       if (p[2] === "guests") {
         if (p[3] === "import" && method === "POST") {
-          const { csv } = z
-            .object({ csv: z.string().max(500000) })
+          const { csv, mapping, preview, partial } = z
+            .object({
+              csv: z.string().max(500000),
+              mapping: z.record(z.string(), z.string()).default({}),
+              preview: z.boolean().default(false),
+              partial: z.boolean().default(false),
+            })
             .parse(await json(req));
-          let rows: any[];
+          let report;
           try {
-            rows = parse(csv, {
-              columns: true,
-              skip_empty_lines: true,
-              bom: true,
-              trim: true,
-            });
-          } catch {
-            return fail(400, "Invalid CSV format");
+            report = previewImport(csv, e.invitations, mapping);
+          } catch (err) {
+            return fail(400, (err as Error).message);
           }
-          if (rows.length > 1000) fail(400, "Maximum 1,000 rows per import");
-          const errors: { row: number; message: string }[] = [];
-          const seen = new Set(e.invitations.map((i) => i.dedupeKey));
-          const valid: any[] = [];
-          rows.forEach((row, i) => {
-            const result = guestSchema.safeParse(row);
-            if (!result.success) {
-              errors.push({
-                row: i + 2,
-                message: result.error.issues
-                  .map((x) => `${x.path.join(".")}: ${x.message}`)
-                  .join("; "),
-              });
-              return;
-            }
-            const key = dedupe(result.data);
-            if (seen.has(key)) {
-              errors.push({ row: i + 2, message: "Duplicate guest" });
-              return;
-            }
-            seen.add(key);
-            valid.push(result.data);
-          });
-          if (errors.length) return ok({ imported: 0, errors }, 422);
+          if (preview) return ok(report);
+          const { errors } = report;
+          if (errors.length && !partial)
+            return ok({ imported: 0, errors }, 422);
+          const valid = report.rows.flatMap((r) => (r.data ? [r.data] : []));
           await db.$transaction(async (tx) => {
             for (const g of valid) {
               const h = g.household
@@ -538,12 +916,29 @@ async function handle(
               });
             }
           });
-          await audit("guests.imported", e.ownerId, e.id);
-          return ok({ imported: valid.length, errors: [] });
+          await audit("guests.imported", e.actorId, e.id);
+          return ok({ imported: valid.length, errors });
         }
         if (method === "GET") return ok(e.invitations);
         if (method === "POST" || method === "PATCH") {
           const g = guestSchema.parse(await json(req));
+          if (g.members.length > g.invitedSize)
+            fail(400, "Member names exceed invited size");
+          if (
+            g.invitedSessionIds.some(
+              (id) => !e.sessions.some((s) => s.id === id),
+            )
+          )
+            fail(400, "Invalid function selection");
+          if (g.household) {
+            const canonical = await db.household.findFirst({
+              where: {
+                eventId: e.id,
+                name: { equals: g.household, mode: "insensitive" },
+              },
+            });
+            if (canonical) g.household = canonical.name;
+          }
           const target = p[3] ? e.invitations.find((i) => i.id === p[3]) : null;
           if (method === "PATCH" && !target) fail(404, "Guest not found");
           if (target?.rsvp && target.rsvp.partySize > g.invitedSize)
@@ -571,14 +966,14 @@ async function handle(
                   where: { id: target!.id },
                   data: data2,
                 });
-          await audit("guest.saved", e.ownerId, e.id);
+          await audit("guest.saved", e.actorId, e.id);
           return ok(inv, method === "POST" ? 201 : 200);
         }
         if (method === "DELETE") {
           const target = e.invitations.find((i) => i.id === p[3]);
           if (!target) fail(404, "Guest not found");
           await db.invitation.delete({ where: { id: target!.id } });
-          await audit("guest.deleted", e.ownerId, e.id);
+          await audit("guest.deleted", e.actorId, e.id);
           return ok({ deleted: true });
         }
       }
@@ -595,7 +990,7 @@ async function handle(
             where: { id: e.id },
             data: { publicToken: token() },
           });
-          await audit("invitation.public_rotated", e.ownerId, e.id);
+          await audit("invitation.public_rotated", e.actorId, e.id);
           return ok({ token: updated.publicToken });
         }
         const i = e.invitations.find((i) => i.id === b.guestId);
@@ -611,17 +1006,309 @@ async function handle(
         );
         return ok({ token: i!.token });
       }
-      if (p[2] === "sessions" && method === "POST") {
+      if (p[2] === "sessions" && ["POST", "PATCH"].includes(method)) {
+        if (method === "POST" && e.sessions.length >= 30)
+          fail(400, "Maximum 30 functions");
+        if (method === "PATCH" && !e.sessions.some((s) => s.id === p[3]))
+          fail(404, "Function not found");
         const v = z
           .object({
-            title: z.string().min(2).max(100),
+            title: z.string().trim().min(2).max(100),
             startsAt: z.iso.datetime(),
+            venue: z.string().max(200).default(""),
+            mapsUrl: z
+              .union([
+                z.url().refine((v) => v.startsWith("https://")),
+                z.literal(""),
+              ])
+              .default(""),
+            rsvpEnabled: z.boolean().default(true),
+            deadline: z.iso.datetime().nullable().default(null),
+            mealsEnabled: z.boolean().default(true),
           })
           .parse(await json(req));
-        return ok(
-          await db.eventSession.create({ data: { ...v, eventId: e.id } }),
-          201,
-        );
+        const saved =
+          method === "POST"
+            ? await db.eventSession.create({ data: { ...v, eventId: e.id } })
+            : await db.eventSession.update({ where: { id: p[3] }, data: v });
+        await audit("function.saved", e.actorId, e.id);
+        return ok(saved, method === "POST" ? 201 : 200);
+      }
+      if (p[2] === "households") {
+        if (method === "GET")
+          return ok(
+            await db.household.findMany({
+              where: { eventId: e.id },
+              include: {
+                invitations: {
+                  include: { rsvp: { include: { selections: true } } },
+                },
+              },
+            }),
+          );
+        const h = p[3]
+          ? await db.household.findFirst({ where: { id: p[3], eventId: e.id } })
+          : null;
+        if (p[3] && !h) fail(404, "Household not found");
+        if (method === "DELETE") {
+          if (!h) fail(404, "Household not found");
+          await db.household.delete({ where: { id: h!.id } });
+          await audit("household.removed", e.actorId, e.id);
+          return ok({ deleted: true });
+        }
+        if (method === "POST" && p[4] === "merge") {
+          const { targetId } = z
+            .object({ targetId: z.string() })
+            .parse(await json(req));
+          const target = await db.household.findFirst({
+            where: { id: targetId, eventId: e.id },
+          });
+          if (!h || !target || h.id === target.id)
+            fail(400, "Choose two different households from this event");
+          await db.$transaction(async (tx) => {
+            await tx.invitation.updateMany({
+              where: { householdId: h!.id, eventId: e.id },
+              data: { householdId: target!.id },
+            });
+            await tx.household.delete({ where: { id: h!.id } });
+            await tx.auditLog.create({
+              data: {
+                action: "household.merged",
+                actorId: e.actorId,
+                entityId: e.id,
+              },
+            });
+          });
+          return ok({ merged: true });
+        }
+        if (["POST", "PATCH"].includes(method)) {
+          const { name } = z
+            .object({ name: z.string().trim().min(1).max(120) })
+            .parse(await json(req));
+          const duplicate = await db.household.findFirst({
+            where: {
+              eventId: e.id,
+              name: { equals: name, mode: "insensitive" },
+              ...(h ? { id: { not: h.id } } : {}),
+            },
+          });
+          if (duplicate) fail(409, "Household already exists");
+          const saved = h
+            ? await db.household.update({ where: { id: h.id }, data: { name } })
+            : await db.household.create({ data: { name, eventId: e.id } });
+          await audit("household.saved", e.actorId, e.id);
+          return ok(saved);
+        }
+      }
+      if (p[2] === "collaborators") {
+        if (method === "GET")
+          return ok(
+            e.collaborators.map((c) => ({
+              id: c.id,
+              email: c.email,
+              role: c.role,
+              acceptedAt: c.acceptedAt,
+              expiresAt: c.expiresAt,
+            })),
+          );
+        if (method === "DELETE") {
+          const result = await db.collaborator.deleteMany({
+            where: { id: p[3], eventId: e.id },
+          });
+          if (!result.count) fail(404, "Collaborator not found");
+          await audit("collaborator.removed", e.actorId, e.id);
+          return ok({ removed: true });
+        }
+        if (method === "POST") {
+          const { email, role } = z
+            .object({
+              email: z.email().transform((v) => v.toLowerCase()),
+              role: z.enum(["MANAGER", "VIEWER", "PARTNER"]),
+            })
+            .parse(await json(req));
+          const u = await user(req);
+          if (email === u.email) fail(400, "The owner already has full access");
+          const raw = token();
+          const c = await db.collaborator.upsert({
+            where: { eventId_email: { eventId: e.id, email } },
+            create: {
+              eventId: e.id,
+              email,
+              role,
+              tokenHash: digest(raw),
+              expiresAt: new Date(Date.now() + 7 * 86400000),
+            },
+            update: {
+              role,
+              tokenHash: digest(raw),
+              expiresAt: new Date(Date.now() + 7 * 86400000),
+              userId: null,
+              acceptedAt: null,
+            },
+          });
+          await audit("collaborator.invited", e.actorId, e.id);
+          return ok(
+            {
+              id: c.id,
+              invitationUrl: `${new URL(process.env.APP_URL || "http://localhost:3000").origin}/dashboard?collaborationToken=${raw}`,
+              expiresAt: c.expiresAt,
+            },
+            201,
+          );
+        }
+      }
+      if (p[2] === "reminders") {
+        if (method === "GET")
+          return ok(
+            await db.reminder.findMany({
+              where: { invitation: { eventId: e.id } },
+              orderBy: { preparedAt: "desc" },
+              take: 500,
+            }),
+          );
+        if (method === "POST") {
+          const { invitationId, kind } = z
+            .object({ invitationId: z.string(), kind: z.enum(reminderKinds) })
+            .parse(await json(req));
+          const i = e.invitations.find(
+            (i) =>
+              i.id === invitationId && !i.revoked && i.source === "TRACKED",
+          );
+          if (!i) fail(404, "Invitation not found");
+          const url = `${new URL(process.env.APP_URL || "http://localhost:3000").origin}/invite/${i!.token}`;
+          const message = reminderMessage(kind, e, i!.name, url);
+          const reminder = await db.reminder.create({
+            data: { invitationId, kind, message },
+          });
+          await audit("reminder.prepared", e.actorId, e.id);
+          return ok(
+            {
+              ...reminder,
+              shareUrl: `https://wa.me/${i!.phone?.replace(/\D/g, "") || ""}?text=${encodeURIComponent(message)}`,
+            },
+            201,
+          );
+        }
+      }
+      if (p[2] === "forecasts") {
+        if (method === "GET")
+          return ok(
+            await db.forecastSnapshot.findMany({
+              where: { eventId: e.id },
+              orderBy: { calculatedAt: "desc" },
+              take: 100,
+            }),
+          );
+        if (method === "POST") {
+          const { sessionId } = z
+            .object({ sessionId: z.string() })
+            .parse(await json(req));
+          const result = aggregate(e).functions.find(
+            (s: { id: string }) => s.id === sessionId,
+          );
+          if (!result) fail(404, "Function not found");
+          return ok(
+            await db.forecastSnapshot.create({
+              data: {
+                eventId: e.id,
+                sessionId,
+                assumptions: {
+                  confirmedProbability: e.settings!.confirmedProbability,
+                  maybeProbability: e.settings!.maybeProbability,
+                  pendingProbability: e.settings!.pendingProbability,
+                  contingency: e.settings!.contingency,
+                  publicPendingPopulation: "unknown",
+                },
+                inputs: {
+                  confirmed: result!.confirmed,
+                  maybe: result!.maybe,
+                  pending: result!.pending,
+                },
+                result: result!,
+              },
+            }),
+            201,
+          );
+        }
+      }
+      if (p[2] === "check-ins") {
+        if (method === "GET")
+          return ok(
+            await db.checkIn.findMany({
+              where: { invitation: { eventId: e.id } },
+            }),
+          );
+        if (["POST", "PATCH"].includes(method)) {
+          const v = z
+            .object({
+              sessionId: z.string(),
+              invitationId: z.string().optional(),
+              token: z
+                .string()
+                .regex(/^[a-f0-9]{64}$/)
+                .optional(),
+              count: z.number().int().min(0).max(100),
+              reason: z.string().trim().min(3).max(300).optional(),
+            })
+            .parse(await json(req));
+          if (!e.sessions.some((s) => s.id === v.sessionId))
+            fail(404, "Function not found");
+          const inv = e.invitations.find((i) =>
+            v.invitationId ? i.id === v.invitationId : i.token === v.token,
+          );
+          if (
+            !inv ||
+            inv.revoked ||
+            (inv.invitedSessionIds.length &&
+              !inv.invitedSessionIds.includes(v.sessionId))
+          )
+            fail(404, "Invitation unavailable for this function");
+          if (v.count > inv!.invitedSize)
+            fail(400, "Arrival count exceeds invited party size");
+          if (method === "PATCH" && !v.reason)
+            fail(400, "A correction reason is required");
+          const saved = await db.$transaction(async (tx) => {
+            await tx.$queryRaw`SELECT id FROM "Event" WHERE id = ${e.id} FOR UPDATE`;
+            const existing = await tx.checkIn.findUnique({
+              where: {
+                invitationId_sessionId: {
+                  invitationId: inv!.id,
+                  sessionId: v.sessionId,
+                },
+              },
+            });
+            if (method === "POST" && existing)
+              fail(
+                409,
+                "This household is already checked in for this function",
+              );
+            if (method === "PATCH" && !existing)
+              fail(404, "Check-in not found");
+            const result = existing
+              ? await tx.checkIn.update({
+                  where: { id: existing.id },
+                  data: { count: v.count },
+                })
+              : await tx.checkIn.create({
+                  data: {
+                    invitationId: inv!.id,
+                    sessionId: v.sessionId,
+                    count: v.count,
+                  },
+                });
+            await tx.auditLog.create({
+              data: {
+                actorId: e.actorId,
+                action: existing
+                  ? `checkin.corrected:${existing.count}->${v.count}:${v.reason}`
+                  : `checkin.created:${v.count}`,
+                entityId: result.id,
+              },
+            });
+            return result;
+          });
+          return ok(saved, method === "POST" ? 201 : 200);
+        }
       }
       if (p[2] === "catering") {
         if (method === "GET")
@@ -649,6 +1336,7 @@ async function handle(
               nonVegetarian: z.coerce.number().int().min(0),
               originalCount: z.coerce.number().int().min(0).max(100000),
               mealType: z.string().max(100),
+              planningNotes: z.string().max(2000).default(""),
             })
             .parse(await json(req));
           if (!e.sessions.some((s) => s.id === v.sessionId))
@@ -660,7 +1348,7 @@ async function handle(
             create: v,
             update: v,
           });
-          await audit("catering.saved", e.ownerId, e.id);
+          await audit("catering.saved", e.actorId, e.id);
           return ok({ ...saved, calculation: catering(saved) });
         }
       }

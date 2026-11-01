@@ -15,6 +15,8 @@ model User {
  sessions Session[]
  resets PasswordResetToken[]
  events Event[]
+ collaborations Collaborator[]
+ notifications Notification[]
 }
 model Session {
  id String @id @default(cuid())
@@ -46,6 +48,8 @@ model Event {
  address String @default("")
  mapsUrl String @default("")
  coverImage String @default("")
+ font String @default("serif")
+ rsvpLabel String @default("Send my RSVP")
  template String @default("Botanical")
  theme String @default("emerald")
  message String @default("")
@@ -57,11 +61,14 @@ model Event {
  invitations Invitation[]
  households Household[]
  sessions EventSession[]
+ forecasts ForecastSnapshot[]
+ collaborators Collaborator[]
  @@index([ownerId,startsAt])
 }
 model EventSettings {
  eventId String @id
  event Event @relation(fields:[eventId],references:[id],onDelete:Cascade)
+ publicLinksEnabled Boolean @default(true)
  rsvpEnabled Boolean @default(true)
  deadline DateTime?
  allowMaybe Boolean @default(true)
@@ -93,12 +100,17 @@ model Invitation {
  name String
  email String?
  phone String?
+ members String[] @default([])
+ category String @default("Other")
+ invitedSessionIds String[] @default([])
  invitedSize Int @default(1)
  source String @default("TRACKED")
  dedupeKey String
  revoked Boolean @default(false)
  sentAt DateTime?
  createdAt DateTime @default(now())
+ reminders Reminder[]
+ checkIns CheckIn[]
  rsvp RSVP?
  @@unique([eventId,dedupeKey])
  @@index([eventId])
@@ -120,9 +132,15 @@ model EventSession {
  eventId String
  event Event @relation(fields:[eventId],references:[id],onDelete:Cascade)
  title String
+ venue String @default("")
+ mapsUrl String @default("")
+ rsvpEnabled Boolean @default(true)
+ deadline DateTime?
+ mealsEnabled Boolean @default(true)
  startsAt DateTime
  plans CateringPlan[]
  selections RSVPMealSelection[]
+ checkIns CheckIn[]
  @@index([eventId])
 }
 model RSVPMealSelection {
@@ -146,11 +164,13 @@ model CateringPlan {
  vegetarian Int @default(0)
  nonVegetarian Int @default(0)
  originalCount Int
+ planningNotes String @default("")
  mealType String @default("Buffet")
  updatedAt DateTime @updatedAt
 }
 model PartnerLead {
  id String @id @default(cuid())
+ services String @default("")
  businessName String
  contactName String
  category String
@@ -172,4 +192,66 @@ model RateLimit {
  key String @id
  count Int
  expiresAt DateTime
+}
+
+model Reminder {
+ id String @id @default(cuid())
+ invitationId String
+ invitation Invitation @relation(fields:[invitationId],references:[id],onDelete:Cascade)
+ kind String
+ message String
+ preparedAt DateTime @default(now())
+ deliveredAt DateTime?
+ providerReceipt String?
+ @@index([invitationId,preparedAt])
+}
+model ForecastSnapshot {
+ id String @id @default(cuid())
+ eventId String
+ event Event @relation(fields:[eventId],references:[id],onDelete:Cascade)
+ sessionId String
+ assumptions Json
+ inputs Json
+ result Json
+ calculatedAt DateTime @default(now())
+ @@index([eventId,calculatedAt])
+}
+model CheckIn {
+ id String @id @default(cuid())
+ invitationId String
+ invitation Invitation @relation(fields:[invitationId],references:[id],onDelete:Cascade)
+ sessionId String
+ session EventSession @relation(fields:[sessionId],references:[id],onDelete:Cascade)
+ count Int
+ checkedInAt DateTime @default(now())
+ updatedAt DateTime @updatedAt
+ @@unique([invitationId,sessionId])
+}
+
+model Collaborator {
+ id String @id @default(cuid())
+ eventId String
+ event Event @relation(fields:[eventId],references:[id],onDelete:Cascade)
+ email String
+ role String
+ userId String?
+ user User? @relation(fields:[userId],references:[id],onDelete:Cascade)
+ tokenHash String @unique
+ expiresAt DateTime
+ acceptedAt DateTime?
+ createdAt DateTime @default(now())
+ @@unique([eventId,email])
+ @@index([userId])
+}
+model Notification {
+ id String @id @default(cuid())
+ userId String
+ user User @relation(fields:[userId],references:[id],onDelete:Cascade)
+ eventId String?
+ kind String
+ message String
+ dedupeKey String @unique
+ readAt DateTime?
+ createdAt DateTime @default(now())
+ @@index([userId,createdAt])
 }

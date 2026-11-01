@@ -1,0 +1,7 @@
+ALTER TABLE "CateringPlan" ADD COLUMN "planningNotes" TEXT NOT NULL DEFAULT '';
+CREATE TABLE "Reminder" ("id" TEXT PRIMARY KEY, "invitationId" TEXT NOT NULL REFERENCES "Invitation"("id") ON DELETE CASCADE, "kind" TEXT NOT NULL, "message" TEXT NOT NULL, "preparedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP, "deliveredAt" TIMESTAMP(3), "providerReceipt" TEXT, CONSTRAINT "Reminder_delivery_check" CHECK ("deliveredAt" IS NULL OR "providerReceipt" IS NOT NULL));
+CREATE INDEX "Reminder_invitationId_preparedAt_idx" ON "Reminder"("invitationId", "preparedAt");
+CREATE TABLE "ForecastSnapshot" ("id" TEXT PRIMARY KEY, "eventId" TEXT NOT NULL REFERENCES "Event"("id") ON DELETE CASCADE, "sessionId" TEXT NOT NULL, "assumptions" JSONB NOT NULL, "inputs" JSONB NOT NULL, "result" JSONB NOT NULL, "calculatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX "ForecastSnapshot_eventId_calculatedAt_idx" ON "ForecastSnapshot"("eventId", "calculatedAt");
+CREATE TABLE "CheckIn" ("id" TEXT PRIMARY KEY, "invitationId" TEXT NOT NULL REFERENCES "Invitation"("id") ON DELETE CASCADE, "sessionId" TEXT NOT NULL REFERENCES "EventSession"("id") ON DELETE CASCADE, "count" INTEGER NOT NULL CHECK ("count" BETWEEN 0 AND 100), "checkedInAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP, "updatedAt" TIMESTAMP(3) NOT NULL);
+CREATE UNIQUE INDEX "CheckIn_invitationId_sessionId_key" ON "CheckIn"("invitationId", "sessionId");

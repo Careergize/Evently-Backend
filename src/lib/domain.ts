@@ -1,9 +1,30 @@
 import { z } from "zod";
+export function validCoverImage(value: string) {
+  if (!value) return true;
+  const match =
+    /^data:image\/(png|jpeg|webp);base64,([A-Za-z0-9+/]+={0,2})$/.exec(value);
+  if (!match) return false;
+  const bytes = Buffer.from(match[2], "base64");
+  if (bytes.length > 500000) return false;
+  if (match[1] === "png")
+    return bytes
+      .subarray(0, 8)
+      .equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+  if (match[1] === "jpeg")
+    return bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255;
+  return (
+    bytes.toString("ascii", 0, 4) === "RIFF" &&
+    bytes.toString("ascii", 8, 12) === "WEBP"
+  );
+}
 export const guestSchema = z.object({
   name: z.string().trim().min(1).max(120),
   email: z.union([z.email(), z.literal("")]).optional(),
   phone: z.string().max(30).optional(),
   household: z.string().trim().max(120).optional(),
+  members: z.array(z.string().trim().min(1).max(120)).max(100).default([]),
+  category: z.string().trim().min(1).max(60).default("Other"),
+  invitedSessionIds: z.array(z.string().min(1)).max(30).default([]),
   invitedSize: z.coerce.number().int().min(1).max(100),
 });
 export const eventSchema = z.object({
@@ -29,17 +50,27 @@ export const eventSchema = z.object({
   coverImage: z
     .string()
     .max(750000)
-    .refine(
-      (v) =>
-        !v || /^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(v),
-      "Use a PNG, JPEG or WebP under 500 KB",
-    )
+    .refine(validCoverImage, "Use a PNG, JPEG or WebP under 500 KB")
     .default(""),
-  template: z.enum(["Botanical", "Royal", "Minimal"]).default("Botanical"),
+  font: z.enum(["serif", "sans", "classic"]).default("serif"),
+  rsvpLabel: z.string().trim().min(1).max(60).default("Send my RSVP"),
+  template: z
+    .enum([
+      "Botanical",
+      "Royal",
+      "Minimal",
+      "Kerala",
+      "Modern",
+      "Floral",
+      "Birthday",
+      "Family",
+    ])
+    .default("Botanical"),
   theme: z.enum(["emerald", "gold", "rose"]).default("emerald"),
   message: z.string().max(3000).default(""),
   status: z.enum(["DRAFT", "PUBLISHED"]).default("DRAFT"),
   settings: z.object({
+    publicLinksEnabled: z.boolean().default(true),
     rsvpEnabled: z.boolean(),
     deadline: z.iso.datetime().nullable(),
     allowMaybe: z.boolean(),
@@ -84,6 +115,22 @@ export function validateResponse(
   now = new Date(),
 ) {
   const s = event.settings;
+  if (
+    input.status !== "NO" &&
+    input.selections?.some((v: any) => {
+      const session = event.sessions.find((x: any) => x.id === v.sessionId);
+      const allowed =
+        !invitation?.invitedSessionIds?.length ||
+        invitation.invitedSessionIds.includes(v.sessionId);
+      return (
+        v.attendees > 0 &&
+        (!allowed ||
+          session?.rsvpEnabled === false ||
+          (session?.deadline && new Date(session.deadline) < now))
+      );
+    })
+  )
+    throw Error("Invalid session attendance: function unavailable or closed");
   if (event.status !== "PUBLISHED" || invitation?.revoked)
     throw Error("Invitation unavailable");
   if (!s.rsvpEnabled || (s.deadline && new Date(s.deadline) < now))
@@ -169,6 +216,67 @@ export function aggregate(event: any) {
     trend: Object.entries(trend)
       .sort()
       .map(([date, responses]) => ({ date, responses })),
+    functions: (event.sessions || []).map((session: any) => {
+      let invited = 0,
+        confirmed = 0,
+        maybe = 0,
+        pending = 0;
+      const meals: Record<string, number> = {};
+      for (const i of event.invitations.filter((i: any) => !i.revoked)) {
+        if (
+          i.invitedSessionIds?.length &&
+          !i.invitedSessionIds.includes(session.id)
+        )
+          continue;
+        if (i.source === "TRACKED") invited += i.invitedSize;
+        if (!i.rsvp && i.source === "TRACKED") pending += i.invitedSize;
+        const selection = i.rsvp?.selections?.find(
+          (v: any) => v.sessionId === session.id,
+        );
+        if (!selection) continue;
+        if (i.rsvp.status === "YES") {
+          confirmed += selection.attendees;
+          meals[selection.meal] =
+            (meals[selection.meal] || 0) + selection.attendees;
+        }
+        if (i.rsvp.status === "MAYBE") maybe += selection.attendees;
+      }
+      const expected = Math.max(
+        0,
+        Math.round(
+          confirmed * s.confirmedProbability +
+            maybe * s.maybeProbability +
+            pending * s.pendingProbability,
+        ),
+      );
+      return {
+        id: session.id,
+        title: session.title,
+        actual: (session.checkIns || []).reduce(
+          (n: number, row: any) => n + row.count,
+          0,
+        ),
+        invited,
+        confirmed,
+        maybe,
+        pending,
+        expected,
+        meals,
+        recommended: Math.ceil(expected * (1 + s.contingency / 100)),
+      };
+    }),
+    categories: Object.entries(
+      event.invitations
+        .filter((i: any) => !i.revoked)
+        .reduce((acc: Record<string, any>, i: any) => {
+          const key = i.category || "Other";
+          acc[key] ||= { invited: 0, confirmed: 0, maybe: 0 };
+          if (i.source === "TRACKED") acc[key].invited += i.invitedSize;
+          if (i.rsvp?.status === "YES") acc[key].confirmed += i.rsvp.partySize;
+          if (i.rsvp?.status === "MAYBE") acc[key].maybe += i.rsvp.partySize;
+          return acc;
+        }, {}),
+    ).map(([name, counts]: any) => ({ name, ...counts })),
     represented: confirmed + maybe + declined,
     openPopulationUnknown: true,
   };
